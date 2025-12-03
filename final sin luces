@@ -1,0 +1,1450 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  *
+  * Proyecto: LuxSense - Door (MC-38) + PIR + BME280 + OLED SSD1306
+  *           UART PC (USART3) + UART ESP (UART4) + PWM FAN (TIM1_CH2)
+  *           STM32H755ZI-Q (CM7) + FreeRTOS
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+typedef enum {
+  ROOM_MODE_STANDBY = 0,  // Puerta abierta, todo apagado
+  ROOM_MODE_CONFORT,      // Puerta cerrada + movimiento reciente
+  ROOM_MODE_ECO           // Puerta cerrada + sin movimiento tiempo largo
+} RoomMode;
+
+typedef struct {
+  volatile float temperature;  // °C
+  volatile float pressure;     // hPa
+  volatile float humidity;     // %RH
+} Device_Config;
+
+typedef struct {
+  uint16_t dig_T1;
+  int16_t  dig_T2;
+  int16_t  dig_T3;
+  uint16_t dig_P1;
+  int16_t  dig_P2;
+  int16_t  dig_P3;
+  int16_t  dig_P4;
+  int16_t  dig_P5;
+  int16_t  dig_P6;
+  int16_t  dig_P7;
+  int16_t  dig_P8;
+  int16_t  dig_P9;
+  uint8_t  dig_H1;
+  int16_t  dig_H2;
+  uint8_t  dig_H3;
+  int16_t  dig_H4;
+  int16_t  dig_H5;
+  int8_t   dig_H6;
+} Calibration_Data;
+
+typedef struct {
+  uint8_t          ID;
+  bool             deviceReady;
+  bool             dataReady;
+  uint8_t          rawData[8];
+  uint32_t         rawTemperature;
+  uint32_t         rawPressure;
+  uint16_t         rawHumidity;
+  Calibration_Data coef;
+} BME_Config;
+
+typedef struct {
+  bool      doorClosed;      // true = puerta cerrada
+  bool      motionPresent;   // true = movimiento reciente PIR
+  RoomMode  mode;
+
+  uint32_t  lastMotionTick;  // tick de último movimiento (para ECO)
+
+  float     temperature;
+  float     humidity;
+  float     pressure;
+  uint8_t   fan_pwm;         // 0–100 %
+} RoomState;
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* --- BME280 I2C & registros --- */
+#define BME280_I2C_ADDRESS            (0x76 << 1)   // Ajustar a 0x77<<1 si tu módulo es 0x77
+
+#define BME280_REG_CHIP_ID            0xD0
+#define BME280_REG_CTRL_HUM           0xF2
+#define BME280_REG_STATUS             0xF3
+#define BME280_REG_CTRL_MEAS          0xF4
+#define BME280_REG_CONFIG             0xF5
+#define BME280_REG_DATA               0xF7
+
+#define BME280_REG_T1                 0x88
+#define BME280_REG_T2                 0x8A
+#define BME280_REG_T3                 0x8C
+#define BME280_REG_P1                 0x8E
+#define BME280_REG_P2                 0x90
+#define BME280_REG_P3                 0x92
+#define BME280_REG_P4                 0x94
+#define BME280_REG_P5                 0x96
+#define BME280_REG_P6                 0x98
+#define BME280_REG_P7                 0x9A
+#define BME280_REG_P8                 0x9C
+#define BME280_REG_P9                 0x9E
+
+#define BME280_REG_H1                 0xA1
+#define BME280_REG_H2                 0xE1
+#define BME280_REG_H3                 0xE3
+#define BME280_REG_H4                 0xE4
+#define BME280_REG_H5                 0xE5
+#define BME280_REG_H6                 0xE7
+
+/* Thresholds MODO CONFORT (RUN) */
+#define CONF_TEMP_OFF_THRESHOLD   24.0f   // <24  -> 0%
+#define CONF_TEMP_MID_THRESHOLD   25.0f   // 24–25 -> 50%
+#define CONF_TEMP_HIGH_THRESHOLD  27.0f   // 25–27 -> 75%, >27 -> 100%
+
+/* Thresholds MODO ECO */
+#define ECO_TEMP_OFF_THRESHOLD    26.0f   // <26  -> 0%
+#define ECO_TEMP_MID_THRESHOLD    27.0f   // 26–27 -> 30%
+#define ECO_TEMP_HIGH_THRESHOLD   29.0f   // 27–29 -> 60%, >29 -> 80%
+
+/* Tiempos (ms) */
+#define LOOP_CONTROL_PERIOD_MS        100U          // periodo base de la tarea de control
+#define SAMPLE_PERIOD_CONFORT_MS      2000U         // lectura BME en confort
+#define SAMPLE_PERIOD_ECO_MS          10000U        // lectura BME en eco
+#define SAMPLE_PERIOD_STANDBY_MS      30000U        // lectura BME muy esporádica en standby
+#define ECO_NO_MOTION_MS              (5U * 60U * 1000U)  // 5 min sin movimiento -> ECO
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
+DMA_HandleTypeDef hdma_i2c1_rx;
+DMA_HandleTypeDef hdma_i2c1_tx;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim4;
+DMA_HandleTypeDef hdma_tim4_ch1;
+
+UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart3;
+
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* Task para ambiente (BME+FAN+OLED) */
+osThreadId_t envTaskHandle;
+const osThreadAttr_t envTask_attributes = {
+  .name = "envTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
+
+/* USER CODE BEGIN PV */
+
+Device_Config dev;
+BME_Config    devBME280;
+RoomState     gRoom;
+
+/* RTOS sync primitives */
+osMutexId_t      roomStateMutex;
+osSemaphoreId_t  doorSem;
+osSemaphoreId_t  pirSem;
+
+/* Buffers UART */
+static char uartBuf[128];   // PC (USART3)
+static char espBuf[128];    // ESP (UART4)
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MPU_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_UART4_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_I2C2_Init(void);
+void StartDefaultTask(void *argument);
+void StartEnvTask(void *argument);
+
+/* USER CODE BEGIN PFP */
+
+/* BME280 helpers */
+static void BME280_Init(void);
+static void BME280_ReadCalibration(void);
+static void BME280_WriteReg(uint8_t reg, uint8_t value);
+static bool BME280_ReadSensorOnce(void);
+static void BME280_ProcessRaw(int32_t rawTemp, uint32_t rawPressure, uint16_t rawHumidity);
+
+/* UART helper */
+static void UART_Print(const char *msg);
+
+/* PWM ventilador */
+static void Fan_SetDuty(uint8_t duty_percent);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+static void UART_Print(const char *msg)
+{
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+static void Fan_SetDuty(uint8_t duty_percent)
+{
+  if (duty_percent > 100U)
+  {
+    duty_percent = 100U;
+  }
+
+  uint32_t period  = __HAL_TIM_GET_AUTORELOAD(&htim1); // debería ser 999
+  uint32_t compare = (duty_percent * period) / 100U;
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, compare);
+}
+
+static void BME280_WriteReg(uint8_t reg, uint8_t value)
+{
+  HAL_I2C_Mem_Write(&hi2c1, BME280_I2C_ADDRESS, reg, 1, &value, 1, HAL_MAX_DELAY);
+}
+
+static void BME280_ReadCalibration(void)
+{
+  uint8_t buf[32];
+  uint8_t tmp[2];
+
+  /* T y P (24 bytes desde 0x88) */
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_T1, 1, buf, 24, HAL_MAX_DELAY);
+
+  devBME280.coef.dig_T1 = (buf[1] << 8) | buf[0];
+  devBME280.coef.dig_T2 = (buf[3] << 8) | buf[2];
+  devBME280.coef.dig_T3 = (buf[5] << 8) | buf[4];
+
+  devBME280.coef.dig_P1 = (buf[7] << 8) | buf[6];
+  devBME280.coef.dig_P2 = (buf[9] << 8) | buf[8];
+  devBME280.coef.dig_P3 = (buf[11] << 8) | buf[10];
+  devBME280.coef.dig_P4 = (buf[13] << 8) | buf[12];
+  devBME280.coef.dig_P5 = (buf[15] << 8) | buf[14];
+  devBME280.coef.dig_P6 = (buf[17] << 8) | buf[16];
+  devBME280.coef.dig_P7 = (buf[19] << 8) | buf[18];
+  devBME280.coef.dig_P8 = (buf[21] << 8) | buf[20];
+  devBME280.coef.dig_P9 = (buf[23] << 8) | buf[22];
+
+  /* H1 */
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H1, 1,
+                   &devBME280.coef.dig_H1, 1, HAL_MAX_DELAY);
+
+  /* H2 */
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H2, 1, tmp, 2, HAL_MAX_DELAY);
+  devBME280.coef.dig_H2 = (tmp[1] << 8) | tmp[0];
+
+  /* H3 */
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H3, 1,
+                   &devBME280.coef.dig_H3, 1, HAL_MAX_DELAY);
+
+  /* H4 y H5 son “cruzados” */
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H4, 1, tmp, 2, HAL_MAX_DELAY);
+  devBME280.coef.dig_H4 = ((int16_t)tmp[0] << 4) | (tmp[1] & 0x0F);
+
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H5, 1, tmp, 2, HAL_MAX_DELAY);
+  devBME280.coef.dig_H5 = ((int16_t)tmp[1] << 4) | (tmp[0] >> 4);
+
+  HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS, BME280_REG_H6, 1,
+                   (uint8_t*)&devBME280.coef.dig_H6, 1, HAL_MAX_DELAY);
+}
+
+static void BME280_ProcessRaw(int32_t rawTemp, uint32_t rawPressure, uint16_t rawHumidity)
+{
+  int32_t var1, var2, t_fine, resultTemp;
+  int64_t var1p, var2p, resultPress;
+  int32_t resultHum;
+
+  /* ---- Temperatura ---- */
+  var1 = ((((rawTemp >> 3) - ((int32_t)devBME280.coef.dig_T1 << 1))) *
+          ((int32_t)devBME280.coef.dig_T2)) >> 11;
+
+  var2 = (((((rawTemp >> 4) - (int32_t)devBME280.coef.dig_T1) *
+            ((rawTemp >> 4) - (int32_t)devBME280.coef.dig_T1)) >> 12) *
+          (int32_t)devBME280.coef.dig_T3) >> 14;
+
+  t_fine = var1 + var2;
+  resultTemp = (t_fine * 5 + 128) >> 8;   // 0.01°C
+
+  /* ---- Presión ---- */
+  var1p = (int64_t)t_fine - 128000;
+  var2p = var1p * var1p * (int64_t)devBME280.coef.dig_P6;
+  var2p = var2p + ((var1p * (int64_t)devBME280.coef.dig_P5) << 17);
+  var2p = var2p + (((int64_t)devBME280.coef.dig_P4) << 35);
+  var1p = ((var1p * var1p * (int64_t)devBME280.coef.dig_P3) >> 8) +
+          ((var1p * (int64_t)devBME280.coef.dig_P2) << 12);
+  var1p = (((int64_t)1 << 47) + var1p) * (int64_t)devBME280.coef.dig_P1 >> 33;
+
+  if (var1p == 0) {
+    return; // división por cero
+  }
+
+  resultPress = 1048576 - rawPressure;
+  resultPress = (((resultPress << 31) - var2p) * 3125) / var1p;
+  var1p = ((int64_t)devBME280.coef.dig_P9 *
+          (resultPress >> 13) *
+          (resultPress >> 13)) >> 25;
+  var2p = ((int64_t)devBME280.coef.dig_P8 * resultPress) >> 19;
+
+  resultPress = ((resultPress + var1p + var2p) >> 8) +
+                ((int64_t)devBME280.coef.dig_P7 << 4);
+
+  /* ---- Humedad ---- */
+  resultHum = t_fine - (int32_t)76800;
+  resultHum =
+    ((((rawHumidity << 14) - ((int32_t)devBME280.coef.dig_H4 << 20) -
+       ((int32_t)devBME280.coef.dig_H5 * resultHum)) + (int32_t)16384) >> 15) *
+    (((((((resultHum * (int32_t)devBME280.coef.dig_H6) >> 10) *
+         (((resultHum * (int32_t)devBME280.coef.dig_H3) >> 11) +
+          (int32_t)32768)) >> 10) + (int32_t)2097152) *
+       (int32_t)devBME280.coef.dig_H2 + 8192) >> 14);
+
+  resultHum = resultHum -
+              (((((resultHum >> 15) * (resultHum >> 15)) >> 7) *
+                (int32_t)devBME280.coef.dig_H1) >> 4);
+
+  if (resultHum < 0) {
+    resultHum = 0;
+  } else if (resultHum > 419430400) {
+    resultHum = 419430400;
+  }
+  resultHum >>= 12;
+
+  dev.temperature = ((float)resultTemp / 100.0f);
+  dev.pressure    = ((float)resultPress / 256.0f / 100.0f);
+  dev.humidity    = ((float)resultHum / 1024.0f);
+}
+
+static bool BME280_ReadSensorOnce(void)
+{
+  if (!devBME280.deviceReady) {
+    return false;
+  }
+
+  if (HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS,
+                       BME280_REG_DATA, 1,
+                       devBME280.rawData, 8,
+                       HAL_MAX_DELAY) != HAL_OK) {
+    return false;
+  }
+
+  devBME280.rawPressure =
+    (devBME280.rawData[0] << 12) |
+    (devBME280.rawData[1] << 4)  |
+    (devBME280.rawData[2] >> 4);
+
+  devBME280.rawTemperature =
+    (devBME280.rawData[3] << 12) |
+    (devBME280.rawData[4] << 4)  |
+    (devBME280.rawData[5] >> 4);
+
+  devBME280.rawHumidity =
+    (devBME280.rawData[6] << 8) |
+    (devBME280.rawData[7]);
+
+  BME280_ProcessRaw((int32_t)devBME280.rawTemperature,
+                    devBME280.rawPressure,
+                    devBME280.rawHumidity);
+
+  devBME280.dataReady = true;
+  return true;
+}
+
+static void BME280_Init(void)
+{
+  memset(&dev, 0, sizeof(dev));
+  memset(&devBME280, 0, sizeof(devBME280));
+
+  uint8_t id = 0;
+  if (HAL_I2C_Mem_Read(&hi2c1, BME280_I2C_ADDRESS,
+                       BME280_REG_CHIP_ID, 1,
+                       &id, 1, 1000) != HAL_OK) {
+    devBME280.deviceReady = false;
+    UART_Print("BME280: No responde en I2C\r\n");
+    return;
+  }
+
+  if (id != 0x60) {
+    devBME280.deviceReady = false;
+    UART_Print("BME280: Chip ID incorrecto\r\n");
+    return;
+  }
+
+  devBME280.ID = id;
+  devBME280.deviceReady = true;
+  UART_Print("BME280 detectado (ID=0x60)\r\n");
+
+  /* Calibración */
+  BME280_ReadCalibration();
+
+  /* Configuración “weather monitoring”: oversampling x1, modo normal */
+  uint8_t ctrl_hum  = 0b00000001; // OSRS_H = x1
+  uint8_t ctrl_meas = 0b00100111; // T x1, P x1, modo normal
+  uint8_t config    = 0b10100000; // t_standby = 1000 ms, filter off
+
+  BME280_WriteReg(BME280_REG_CTRL_HUM,  ctrl_hum);
+  BME280_WriteReg(BME280_REG_CTRL_MEAS, ctrl_meas);
+  BME280_WriteReg(BME280_REG_CONFIG,    config);
+}
+
+/* EXTI callback: puerta + PIR → dan semáforos a la tarea */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == DOOR_Pin) {
+    osSemaphoreRelease(doorSem);
+  }
+  else if (GPIO_Pin == PIR_Pin) {
+    osSemaphoreRelease(pirSem);
+  }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+/* USER CODE BEGIN Boot_Mode_Sequence_0 */
+/* USER CODE END Boot_Mode_Sequence_0 */
+
+  /* MPU Configuration--------------------------------------------------------*/
+  MPU_Config();
+
+/* USER CODE BEGIN Boot_Mode_Sequence_1 */
+/* USER CODE END Boot_Mode_Sequence_1 */
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+/* USER CODE BEGIN Boot_Mode_Sequence_2 */
+/* USER CODE END Boot_Mode_Sequence_2 */
+
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_USART3_UART_Init();
+  MX_UART4_Init();
+  MX_TIM1_Init();
+  MX_ADC1_Init();
+  MX_TIM4_Init();
+  MX_I2C2_Init();
+  /* USER CODE BEGIN 2 */
+
+  UART_Print("\r\n--- LuxSense CM7 START ---\r\n");
+
+  /* Iniciar PWM ventilador (TIM1_CH2) */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  Fan_SetDuty(0);
+
+  /* Inicializar BME280 en I2C1 */
+  BME280_Init();
+  if (!devBME280.deviceReady) {
+    UART_Print("BME280 NO listo, revisa conexiones/direccion I2C\r\n");
+  }
+
+  /* Inicializar OLED SSD1306 en I2C2 */
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString("LuxSense CM7", Font_7x10, White);
+  ssd1306_SetCursor(0, 12);
+  ssd1306_WriteString("Booting...", Font_7x10, White);
+  ssd1306_UpdateScreen();
+
+  /* Estado inicial del cuarto */
+  memset(&gRoom, 0, sizeof(gRoom));
+  gRoom.mode = ROOM_MODE_STANDBY;
+
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  const osMutexAttr_t roomStateMutex_attr = {
+    .name = "roomStateMutex"
+  };
+  roomStateMutex = osMutexNew(&roomStateMutex_attr);
+  if (roomStateMutex == NULL) {
+    Error_Handler();
+  }
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  const osSemaphoreAttr_t doorSem_attr = {
+    .name = "doorSem"
+  };
+  doorSem = osSemaphoreNew(1, 0, &doorSem_attr);   // empieza en 0
+
+  const osSemaphoreAttr_t pirSem_attr = {
+    .name = "pirSem"
+  };
+  pirSem = osSemaphoreNew(1, 0, &pirSem_attr);     // empieza en 0
+
+  if (doorSem == NULL || pirSem == NULL) {
+    Error_Handler();
+  }
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask (control puerta/PIR + modos) */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of envTask (BME + FAN + OLED + UART) */
+  envTaskHandle = osThreadNew(StartEnvTask, NULL, &envTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_CRSInitTypeDef RCC_CRSInitStruct = {0};
+
+  /** Supply configuration update enable
+  */
+  HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI
+                              |RCC_OSCILLATORTYPE_LSE;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 12;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 4096;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
+                              |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Enable the SYSCFG APB clock
+  */
+  __HAL_RCC_CRS_CLK_ENABLE();
+
+  /** Configures CRS
+  */
+  RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+  RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_LSE;
+  RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  RCC_CRSInitStruct.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000,32768);
+  RCC_CRSInitStruct.ErrorLimitValue = 34;
+  RCC_CRSInitStruct.HSI48CalibrationValue = 32;
+
+  HAL_RCCEx_CRSConfig(&RCC_CRSInitStruct);
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_16B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
+  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.Oversampling.Ratio = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  sConfig.OffsetSignedSaturation = DISABLE;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00C0EAFF;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
+
+  /* USER CODE BEGIN I2C2_Init 0 */
+
+  /* USER CODE END I2C2_Init 0 */
+
+  /* USER CODE BEGIN I2C2_Init 1 */
+
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x00C0EAFF;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
+
+  /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 119;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 125;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
+
+}
+
+/**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART4_Init(void)
+{
+
+  /* USER CODE BEGIN UART4_Init 0 */
+  /* USER CODE END UART4_Init 0 */
+
+  /* USER CODE BEGIN UART4_Init 1 */
+  /* USER CODE END UART4_Init 1 */
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 115200;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart4.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart4.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart4.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart4, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart4, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART4_Init 2 */
+  /* USER CODE END UART4_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA1_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LED_STATUS_Pin|LED_FAN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LED_ACTIVITY_GPIO_Port, LED_ACTIVITY_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : DOOR_Pin (EXTI) */
+  GPIO_InitStruct.Pin = DOOR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(DOOR_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PIR_Pin (EXTI también, para ahorrar energía) */
+  GPIO_InitStruct.Pin = PIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(PIR_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED_STATUS_Pin */
+  GPIO_InitStruct.Pin = LED_STATUS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(LED_STATUS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED_FAN_Pin */
+  GPIO_InitStruct.Pin = LED_FAN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_FAN_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED_ACTIVITY_Pin */
+  GPIO_InitStruct.Pin = LED_ACTIVITY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_ACTIVITY_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* IMPORTANTE: ajusta aquí la IRQ correcta dependiendo del pin
+     (EXTI0, EXTI1, EXTI9_5, EXTI15_10, etc.) según tu .ioc */
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* Tarea de control: puerta + PIR + modos (STANDBY/CONFORT/ECO) */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+
+  UART_Print("Task CONTROL iniciada\r\n");
+
+  GPIO_PinState doorLevel = HAL_GPIO_ReadPin(DOOR_GPIO_Port, DOOR_Pin);
+  GPIO_PinState pirLevel  = HAL_GPIO_ReadPin(PIR_GPIO_Port, PIR_Pin);
+
+  uint32_t now = osKernelGetTickCount();
+
+  osMutexAcquire(roomStateMutex, osWaitForever);
+  gRoom.doorClosed     = (doorLevel == GPIO_PIN_RESET); // suponiendo MC-38 a GND
+  gRoom.motionPresent  = (pirLevel  == GPIO_PIN_SET);
+  gRoom.lastMotionTick = now;
+
+  if (!gRoom.doorClosed) {
+    gRoom.mode = ROOM_MODE_STANDBY;
+  } else if (gRoom.motionPresent) {
+    gRoom.mode = ROOM_MODE_CONFORT;
+  } else {
+    gRoom.mode = ROOM_MODE_ECO;
+  }
+  osMutexRelease(roomStateMutex);
+
+  for(;;)
+  {
+    /* Procesar eventos de puerta */
+    while (osSemaphoreAcquire(doorSem, 0) == osOK) {
+      doorLevel = HAL_GPIO_ReadPin(DOOR_GPIO_Port, DOOR_Pin);
+      bool closed = (doorLevel == GPIO_PIN_RESET);
+
+      osMutexAcquire(roomStateMutex, osWaitForever);
+      gRoom.doorClosed = closed;
+
+      if (!closed) {
+        /* Puerta abierta -> STANDBY */
+        gRoom.mode = ROOM_MODE_STANDBY;
+        gRoom.motionPresent = false;
+      } else {
+        /* Puerta cerrada: decidir RUN/ECO según movimiento */
+        if (gRoom.motionPresent) {
+          gRoom.mode = ROOM_MODE_CONFORT;
+          gRoom.lastMotionTick = osKernelGetTickCount();
+        } else {
+          gRoom.mode = ROOM_MODE_ECO;
+        }
+      }
+      osMutexRelease(roomStateMutex);
+    }
+
+    /* Procesar eventos de PIR */
+    while (osSemaphoreAcquire(pirSem, 0) == osOK) {
+      pirLevel = HAL_GPIO_ReadPin(PIR_GPIO_Port, PIR_Pin);
+      bool motion = (pirLevel == GPIO_PIN_SET);
+
+      osMutexAcquire(roomStateMutex, osWaitForever);
+      gRoom.motionPresent = motion;
+      if (motion) {
+        gRoom.lastMotionTick = osKernelGetTickCount();
+        if (gRoom.doorClosed) {
+          gRoom.mode = ROOM_MODE_CONFORT;
+        }
+      }
+      osMutexRelease(roomStateMutex);
+    }
+
+    /* Transición automática CONFORT -> ECO si pasa tiempo sin movimiento */
+    osMutexAcquire(roomStateMutex, osWaitForever);
+    if (gRoom.mode == ROOM_MODE_CONFORT && gRoom.doorClosed) {
+      uint32_t now2 = osKernelGetTickCount();
+      if ((uint32_t)(now2 - gRoom.lastMotionTick) > ECO_NO_MOTION_MS) {
+        gRoom.mode = ROOM_MODE_ECO;
+      }
+    }
+
+    /* Reflejar estado en LED_STATUS (encendido si no estamos en standby) */
+    RoomMode modeSnap = gRoom.mode;
+    osMutexRelease(roomStateMutex);
+
+    if (modeSnap == ROOM_MODE_STANDBY) {
+      HAL_GPIO_WritePin(LED_STATUS_GPIO_Port, LED_STATUS_Pin, GPIO_PIN_RESET);
+    } else {
+      HAL_GPIO_WritePin(LED_STATUS_GPIO_Port, LED_STATUS_Pin, GPIO_PIN_SET);
+    }
+
+    osDelay(LOOP_CONTROL_PERIOD_MS);
+  }
+
+  /* USER CODE END 5 */
+}
+
+/* Tarea de ambiente: lee BME, controla FAN, actualiza OLED y UART */
+void StartEnvTask(void *argument)
+{
+  UART_Print("Task ENV iniciada\r\n");
+
+  for (;;)
+  {
+    RoomMode mode;
+    bool doorClosed;
+    uint32_t samplePeriodMs;
+
+    osMutexAcquire(roomStateMutex, osWaitForever);
+    mode       = gRoom.mode;
+    doorClosed = gRoom.doorClosed;
+    osMutexRelease(roomStateMutex);
+
+    switch (mode) {
+      case ROOM_MODE_CONFORT:
+        samplePeriodMs = SAMPLE_PERIOD_CONFORT_MS;
+        break;
+      case ROOM_MODE_ECO:
+        samplePeriodMs = SAMPLE_PERIOD_ECO_MS;
+        break;
+      default: // STANDBY
+        samplePeriodMs = SAMPLE_PERIOD_STANDBY_MS;
+        break;
+    }
+
+    osDelay(samplePeriodMs);
+
+    /* Si puerta abierta o BME no listo -> fan 0, solo logs mínimos */
+    if (!doorClosed || !devBME280.deviceReady) {
+      Fan_SetDuty(0);
+      HAL_GPIO_WritePin(LED_FAN_GPIO_Port, LED_FAN_Pin, GPIO_PIN_RESET);
+      continue;
+    }
+
+    /* Blink de actividad mientras se lee el sensor */
+    HAL_GPIO_WritePin(LED_ACTIVITY_GPIO_Port, LED_ACTIVITY_Pin, GPIO_PIN_SET);
+
+    if (BME280_ReadSensorOnce()) {
+      uint8_t fan_pwm_local = 0;
+
+      /* Decidir PWM según modo y temperatura */
+      float T = dev.temperature;
+
+      if (mode == ROOM_MODE_CONFORT) {
+        if (T <= CONF_TEMP_OFF_THRESHOLD) {
+          fan_pwm_local = 0;
+        } else if (T < CONF_TEMP_MID_THRESHOLD) {
+          fan_pwm_local = 50;
+        } else if (T < CONF_TEMP_HIGH_THRESHOLD) {
+          fan_pwm_local = 75;
+        } else {
+          fan_pwm_local = 100;
+        }
+      } else if (mode == ROOM_MODE_ECO) {
+        if (T <= ECO_TEMP_OFF_THRESHOLD) {
+          fan_pwm_local = 0;
+        } else if (T < ECO_TEMP_MID_THRESHOLD) {
+          fan_pwm_local = 30;
+        } else if (T < ECO_TEMP_HIGH_THRESHOLD) {
+          fan_pwm_local = 60;
+        } else {
+          fan_pwm_local = 80;
+        }
+      } else {
+        /* STANDBY */
+        fan_pwm_local = 0;
+      }
+
+      /* Actualizar estado global */
+      osMutexAcquire(roomStateMutex, osWaitForever);
+      gRoom.temperature = dev.temperature;
+      gRoom.humidity    = dev.humidity;
+      gRoom.pressure    = dev.pressure;
+      gRoom.fan_pwm     = fan_pwm_local;
+
+      RoomMode modeSnap      = gRoom.mode;
+      bool     doorSnap      = gRoom.doorClosed;
+      bool     motionSnap    = gRoom.motionPresent;
+      float    T_snap        = gRoom.temperature;
+      float    H_snap        = gRoom.humidity;
+      float    P_snap        = gRoom.pressure;
+      uint8_t  fan_snap      = gRoom.fan_pwm;
+      osMutexRelease(roomStateMutex);
+
+      /* Aplicar PWM físico */
+      Fan_SetDuty(fan_pwm_local);
+      HAL_GPIO_WritePin(LED_FAN_GPIO_Port, LED_FAN_Pin,
+                        (fan_pwm_local > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+      /* Actualizar OLED */
+      char line[32];
+      const char *modeStr =
+          (modeSnap == ROOM_MODE_CONFORT) ? "RUN" :
+          (modeSnap == ROOM_MODE_ECO)     ? "ECO" : "STBY";
+
+      ssd1306_Fill(Black);
+
+      // Línea 1: estado puerta + PIR + modo
+      ssd1306_SetCursor(0, 0);
+      snprintf(line, sizeof(line), "D:%s P:%s",
+               doorSnap ? "C" : "A",
+               motionSnap ? "M" : "NM");
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      ssd1306_SetCursor(80, 0);
+      ssd1306_WriteString(modeStr, Font_7x10, White);
+
+      // Línea 2: Temperatura
+      ssd1306_SetCursor(0, 12);
+      snprintf(line, sizeof(line), "T: %.1f C", T_snap);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      // Línea 3: Humedad
+      ssd1306_SetCursor(0, 24);
+      snprintf(line, sizeof(line), "RH: %.1f %%", H_snap);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      // Línea 4: Presión
+      ssd1306_SetCursor(0, 36);
+      snprintf(line, sizeof(line), "P: %.1f hPa", P_snap);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      // Línea 5: Fan
+      ssd1306_SetCursor(0, 48);
+      snprintf(line, sizeof(line), "Fan: %u %%", fan_snap);
+      ssd1306_WriteString(line, Font_7x10, White);
+
+      ssd1306_UpdateScreen();
+
+      /* Log a PC */
+      int len = snprintf(uartBuf, sizeof(uartBuf),
+                         "Mode=%s | Door=%s | PIR=%s | T=%.2f C, RH=%.2f %%, P=%.2f hPa | Fan=%u%%\r\n",
+                         modeStr,
+                         doorSnap ? "CERRADA" : "ABIERTA",
+                         motionSnap ? "MOV" : "SIN_MOV",
+                         T_snap,
+                         H_snap,
+                         P_snap,
+                         fan_snap);
+      if (len > 0) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)uartBuf, (uint16_t)len, HAL_MAX_DELAY);
+      }
+
+      /* Log compacto a ESP (UART4) */
+      int lenEsp = snprintf(espBuf, sizeof(espBuf),
+                            "M=%s,D=%d,PIR=%d,T=%.2f,H=%.2f,P=%.2f,F=%u\r\n",
+                            modeStr,
+                            doorSnap ? 0 : 1,
+                            motionSnap ? 1 : 0,
+                            T_snap, H_snap, P_snap, fan_snap);
+      if (lenEsp > 0) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)espBuf, (uint16_t)lenEsp, HAL_MAX_DELAY);
+      }
+    }
+
+    HAL_GPIO_WritePin(LED_ACTIVITY_GPIO_Port, LED_ACTIVITY_Pin, GPIO_PIN_RESET);
+  }
+}
+
+/* USER CODE END 4 */
+
+ /* MPU Configuration */
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+  /* Disables the MPU */
+  HAL_MPU_Disable();
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x0;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
+  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+  /* Enables the MPU */
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
